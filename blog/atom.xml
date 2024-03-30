@@ -658,10 +658,10 @@ runs a 10% subsample of the tasks defined in <code>Tasks/human_eval_two_agents.j
         <content type="html"><![CDATA[<p><img decoding="async" loading="lazy" alt="Overall structure of AgentOptimizer" src="https://microsoft.github.io/autogen/assets/images/agentoptimizer-33b265dcca6cff56bbf0c9d63ff389f9.png" width="1496" height="600" class="img_ev3q"></p>
 <p><strong>TL;DR:</strong>
 Introducing <strong>AgentOptimizer</strong>, a new class for training LLM agents in the era of LLMs as a service.
-<strong>AgentOptimizer</strong> is able to prompt LLMs to iteratively optimize function/skills of AutoGen agents according to the historical conversation and performance.
-Checkout one implementation for <strong>AgentOptimizer</strong> on <a href="https://github.com/hendrycks/math" target="_blank" rel="noopener noreferrer">MATH</a> dataset
-<a href="https://github.com/microsoft/autogen/blob/main/notebook/agentchat_agentoptimizer.ipynb" target="_blank" rel="noopener noreferrer">here</a>.</p>
-<p>More information could be found in the <a href="https://arxiv.org/abs/2402.11359" target="_blank" rel="noopener noreferrer">paper</a>.</p>
+<strong>AgentOptimizer</strong> is able to prompt LLMs to iteratively optimize function/skills of AutoGen agents according to the historical conversation and performance.</p>
+<p>More information could be found in:</p>
+<p><strong>Paper</strong>: <a href="https://arxiv.org/abs/2402.11359" target="_blank" rel="noopener noreferrer">https://arxiv.org/abs/2402.11359</a>.</p>
+<p><strong>Notebook</strong>: <a href="https://github.com/microsoft/autogen/blob/main/notebook/agentchat_agentoptimizer.ipynb" target="_blank" rel="noopener noreferrer">https://github.com/microsoft/autogen/blob/main/notebook/agentchat_agentoptimizer.ipynb</a>.</p>
 <h2 class="anchor anchorWithStickyNavbar_LWe7" id="introduction">Introduction<a href="https://microsoft.github.io/autogen/blog/2023/12/23/AgentOptimizer#introduction" class="hash-link" aria-label="Direct link to Introduction" title="Direct link to Introduction">​</a></h2>
 <p>In the traditional ML pipeline, we train a model by updating its weights according to the loss on the training set, while in the era of LLM agents, how should we train an agent?
 Here, we take an initial step towards the agent training. Inspired by the <a href="https://platform.openai.com/docs/guides/function-calling" target="_blank" rel="noopener noreferrer">function calling</a> capabilities provided by OpenAI,
