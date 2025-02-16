@@ -2,6 +2,7 @@
 // GrpcAgentRuntime.cs
 
 using System.Collections.Concurrent;
+using System.Text.Json;
 using Grpc.Core;
 using Microsoft.AutoGen.Contracts;
 using Microsoft.AutoGen.Protobuf;
@@ -10,9 +11,10 @@ using Microsoft.Extensions.Logging;
 
 namespace Microsoft.AutoGen.Core.Grpc;
 
-internal sealed class AgentsContainer(IAgentRuntime hostingRuntime)
+internal sealed class AgentsContainer(IAgentRuntime hostingRuntime, IProtoSerializationRegistry serializationRegistry)
 {
     private readonly IAgentRuntime hostingRuntime = hostingRuntime;
+    private readonly IProtoSerializationRegistry serializationRegistry = serializationRegistry;
 
     private Dictionary<Contracts.AgentId, IHostableAgent> agentInstances = new();
     public Dictionary<string, ISubscriptionDefinition> Subscriptions = new();
@@ -28,6 +30,10 @@ internal sealed class AgentsContainer(IAgentRuntime hostingRuntime)
             }
 
             agent = await factoryFunc(agentId, this.hostingRuntime);
+
+            // Just-in-Time register the message types so we can deserialize them
+            agent.RegisterHandledMessageTypes(this.serializationRegistry);
+
             this.agentInstances.Add(agentId, agent);
         }
 
@@ -84,14 +90,16 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
     public GrpcAgentRuntime(AgentRpc.AgentRpcClient client,
                             IHostApplicationLifetime hostApplicationLifetime,
                             IServiceProvider serviceProvider,
-                            ILogger<GrpcAgentRuntime> logger)
+                            ILogger<GrpcAgentRuntime> logger,
+                            bool strictMessageDeserialization = false)
     {
         this._client = client;
         this._logger = logger;
         this._shutdownCts = CancellationTokenSource.CreateLinkedTokenSource(hostApplicationLifetime.ApplicationStopping);
 
         this._messageRouter = new GrpcMessageRouter(client, this, _clientId, logger, this._shutdownCts.Token);
-        this._agentsContainer = new AgentsContainer(this);
+        this._agentsContainer = new AgentsContainer(this, this.SerializationRegistry);
+        this._strictMessageDeserialization = strictMessageDeserialization;
 
         this.ServiceProvider = serviceProvider;
     }
@@ -122,6 +130,7 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
         }
     }
 
+    private readonly bool _strictMessageDeserialization;
     public IProtoSerializationRegistry SerializationRegistry { get; } = new ProtobufSerializationRegistry();
 
     public void Dispose()
@@ -154,6 +163,7 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
 
         var messageContext = new MessageContext(request.RequestId, cancellationToken)
         {
+
             Sender = request.Source?.FromProtobuf() ?? null,
             Topic = null,
             IsRpc = true
@@ -229,8 +239,6 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
 
         var messageId = evt.Id;
         var typeName = evt.Attributes[Constants.DATA_SCHEMA_ATTR].CeString;
-        var serializer = SerializationRegistry.GetSerializer(typeName) ?? throw new Exception();
-        var message = serializer.Deserialize(evt.ProtoData);
 
         var messageContext = new MessageContext(messageId, cancellationToken)
         {
@@ -239,6 +247,10 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
             IsRpc = false
         };
 
+        // We may not have a Serializer registered yet, if this is the first time we are instantiating the agent
+        IProtobufMessageSerializer? serializer = SerializationRegistry.GetSerializer(typeName);
+        object? message = serializer?.Deserialize(evt.ProtoData);
+
         // Iterate over subscriptions values to find receiving agents
         foreach (var subscription in this._agentsContainer.Subscriptions.Values)
         {
@@ -246,17 +258,55 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
             {
                 var recipient = subscription.MapToAgent(topic);
                 var agent = await this._agentsContainer.EnsureAgentAsync(recipient);
-                await agent.OnMessageAsync(message, messageContext);
+
+                // give the serializer a second chance to have been registered
+                serializer ??= SerializationRegistry.GetSerializer(typeName);
+
+                if (serializer != null)
+                {
+                    message ??= serializer.Deserialize(evt.ProtoData);
+                    await agent.OnMessageAsync(message, messageContext);
+                }
+                else if (_strictMessageDeserialization)
+                {
+                    throw new Exception($"Could not find a serializer for message of type {typeName}");
+
+                }
+                else
+                {
+                    _logger.LogWarning($"Could not find a serializer for message of type {typeName}; this is likely due there not yet being an instantiated agent with a contract for it.");
+                }
             }
         }
     }
 
-    public ValueTask StartAsync(CancellationToken cancellationToken)
+    public async ValueTask StartAsync(CancellationToken cancellationToken)
     {
-        return this._messageRouter.StartAsync(cancellationToken);
+        await this._messageRouter.StartAsync(cancellationToken);
+        if (this._agentsContainer.RegisteredAgentTypes.Count > 0)
+        {
+            foreach (var type in this._agentsContainer.RegisteredAgentTypes)
+            {
+                await this._client.RegisterAgentAsync(new RegisterAgentTypeRequest
+                {
+                    Type = type
+                }, this.CallOptions);
+            }
+        }
+
+        if (this._agentsContainer.Subscriptions.Count > 0)
+        {
+            foreach (var subscription in this._agentsContainer.Subscriptions.Values)
+            {
+                await this._client.AddSubscriptionAsync(new AddSubscriptionRequest
+                {
+                    Subscription = subscription.ToProtobuf()
+                }, this.CallOptions);
+            }
+        }
     }
 
-    Task IHostedService.StartAsync(CancellationToken cancellationToken) => this._messageRouter.StartAsync(cancellationToken).AsTask();
+    Task IHostedService.StartAsync(CancellationToken cancellationToken) => this.StartAsync(cancellationToken).AsTask();
 
     public Task StopAsync(CancellationToken cancellationToken)
     {
@@ -274,6 +324,7 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
         var request = new RpcRequest
         {
             RequestId = Guid.NewGuid().ToString(),
+
             Source = sender?.ToProtobuf() ?? null,
             Target = recepient.ToProtobuf(),
             Payload = payload,
@@ -319,13 +370,13 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
     public ValueTask<Contracts.AgentId> GetAgentAsync(string agent, string key = "default", bool lazy = true)
         => this.GetAgentAsync(new Contracts.AgentId(agent, key), lazy);
 
-    public async ValueTask<IDictionary<string, object>> SaveAgentStateAsync(Contracts.AgentId agentId)
+    public async ValueTask<JsonElement> SaveAgentStateAsync(Contracts.AgentId agentId)
     {
         IHostableAgent agent = await this._agentsContainer.EnsureAgentAsync(agentId);
         return await agent.SaveStateAsync();
     }
 
-    public async ValueTask LoadAgentStateAsync(Contracts.AgentId agentId, IDictionary<string, object> state)
+    public async ValueTask LoadAgentStateAsync(Contracts.AgentId agentId, JsonElement state)
     {
         IHostableAgent agent = await this._agentsContainer.EnsureAgentAsync(agentId);
         await agent.LoadStateAsync(state);
@@ -341,30 +392,39 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
     {
         this._agentsContainer.AddSubscription(subscription);
 
-        var _ = await this._client.AddSubscriptionAsync(new AddSubscriptionRequest
+        if (this._messageRouter.IsChannelOpen)
         {
-            Subscription = subscription.ToProtobuf()
-        }, this.CallOptions);
+            var _ = await this._client.AddSubscriptionAsync(new AddSubscriptionRequest
+            {
+                Subscription = subscription.ToProtobuf()
+            }, this.CallOptions);
+        }
     }
 
     public async ValueTask RemoveSubscriptionAsync(string subscriptionId)
     {
         this._agentsContainer.RemoveSubscriptionAsync(subscriptionId);
 
-        await this._client.RemoveSubscriptionAsync(new RemoveSubscriptionRequest
+        if (this._messageRouter.IsChannelOpen)
         {
-            Id = subscriptionId
-        }, this.CallOptions);
+            await this._client.RemoveSubscriptionAsync(new RemoveSubscriptionRequest
+            {
+                Id = subscriptionId
+            }, this.CallOptions);
+        }
     }
 
     public async ValueTask<AgentType> RegisterAgentFactoryAsync(AgentType type, Func<Contracts.AgentId, IAgentRuntime, ValueTask<IHostableAgent>> factoryFunc)
     {
         this._agentsContainer.RegisterAgentFactory(type, factoryFunc);
 
-        await this._client.RegisterAgentAsync(new RegisterAgentTypeRequest
+        if (this._messageRouter.IsChannelOpen)
         {
-            Type = type,
-        }, this.CallOptions);
+            await this._client.RegisterAgentAsync(new RegisterAgentTypeRequest
+            {
+                Type = type,
+            }, this.CallOptions);
+        }
 
         return type;
     }
@@ -375,35 +435,36 @@ public sealed class GrpcAgentRuntime : IHostedService, IAgentRuntime, IMessageSi
         return ValueTask.FromResult(new AgentProxy(agentId, this));
     }
 
-    public async ValueTask<IDictionary<string, object>> SaveStateAsync()
-    {
-        Dictionary<string, object> state = new();
-        foreach (var agent in this._agentsContainer.LiveAgents)
-        {
-            state[agent.Id.ToString()] = await agent.SaveStateAsync();
-        }
-
-        return state;
-    }
-
-    public async ValueTask LoadStateAsync(IDictionary<string, object> state)
+    public async ValueTask LoadStateAsync(JsonElement state)
     {
         HashSet<AgentType> registeredTypes = this._agentsContainer.RegisteredAgentTypes;
 
-        foreach (var agentIdStr in state.Keys)
+        foreach (var agentIdStr in state.EnumerateObject())
         {
-            Contracts.AgentId agentId = Contracts.AgentId.FromStr(agentIdStr);
-            if (state[agentIdStr] is not IDictionary<string, object> agentStateDict)
+            Contracts.AgentId agentId = Contracts.AgentId.FromStr(agentIdStr.Name);
+
+            if (agentIdStr.Value.ValueKind != JsonValueKind.Object)
             {
-                throw new Exception($"Agent state for {agentId} is not a {typeof(IDictionary<string, object>)}: {state[agentIdStr].GetType()}");
+                throw new Exception($"Agent state for {agentId} is not a valid JSON object.");
             }
 
             if (registeredTypes.Contains(agentId.Type))
             {
                 IHostableAgent agent = await this._agentsContainer.EnsureAgentAsync(agentId);
-                await agent.LoadStateAsync(agentStateDict);
+                await agent.LoadStateAsync(agentIdStr.Value);
             }
         }
+    }
+
+    public async ValueTask<JsonElement> SaveStateAsync()
+    {
+        Dictionary<string, JsonElement> state = new();
+        foreach (var agent in this._agentsContainer.LiveAgents)
+        {
+            var agentState = await agent.SaveStateAsync();
+            state[agent.Id.ToString()] = JsonSerializer.SerializeToElement(agentState);
+        }
+        return JsonSerializer.SerializeToElement(state);
     }
 
     public async ValueTask OnMessageAsync(Message message, CancellationToken cancellation = default)
